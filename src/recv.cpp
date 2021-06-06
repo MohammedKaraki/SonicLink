@@ -6,20 +6,26 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <functional>
 #include <vector>
 #include <cstddef>
+#include <cstdio>
 #include <boost/circular_buffer.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <portaudio.h>
 #include "core.h"
+#include "recv.h"
 
-#define FMT_HEADER_ONLY
 #include <fmt/format.h>
 #include <fmt/color.h>
 
-std::mutex raw_mutex;
-std::mutex bit_mutex;
-std::mutex msg_mutex;
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+auto logger = spdlog::rotating_logger_mt("receiver",
+                                         "logs/log.txt",
+                                         1ul << 20,
+                                         2);
+
 
 namespace thread_safe {
     static inline auto size(const auto& buffer, auto& mutex)
@@ -28,6 +34,7 @@ namespace thread_safe {
         return buffer.size();
     }
 }
+
 
 int record_callback(const void *input_buffer,
                     void * /* output_buffer */,
@@ -63,14 +70,14 @@ void launch_mic_loop(boost::lockfree::spsc_queue<float>& lockfree_raw_buffer)
         error = Pa_Initialize();
         if (error != paNoError) {
                 Pa_Terminate();
-                fmt::print(stderr, "{}: {}\n",
-                           error, Pa_GetErrorText(error));
+                logger->error(fmt::format("{}: {}\n",
+                           error, Pa_GetErrorText(error)));
                 exit(1);
         }
 
         input_params.device = Pa_GetDefaultInputDevice();
         if (input_params.device == paNoDevice) {
-                fmt::print(stderr, "Error: No default input device.\n");
+                logger->error(fmt::format("Error: No default input device.\n"));
                 exit(1);
         }
 
@@ -89,17 +96,17 @@ void launch_mic_loop(boost::lockfree::spsc_queue<float>& lockfree_raw_buffer)
                               record_callback,
                               &lockfree_raw_buffer /* user data */);
         if (error != paNoError) {
-                fmt::print(stderr, "{}: {}\n",
-                           error, Pa_GetErrorText(error));
+                logger->error(fmt::format("{}: {}\n",
+                           error, Pa_GetErrorText(error)));
                 exit(1);
         }
 
-        fmt::print(stderr, "starting mic loop\n");
+        logger->info(fmt::format("starting mic loop\n"));
         error = Pa_StartStream(input_stream);
         if (error != paNoError) {
-                fmt::print(stderr, "{}: {}\n",
+                logger->error(fmt::format("{}: {}\n",
                            error,
-                           Pa_GetErrorText(error));
+                           Pa_GetErrorText(error)));
                 exit(1);
         }
 }
@@ -127,14 +134,15 @@ bool check_match(const boost::circular_buffer<BitType>& bit_buffer,
 }
 
 
-
 void extract_msg_loop(boost::circular_buffer<BitType>& bit_buffer,
                       boost::circular_buffer<std::vector<BitType>>& msgs,
-                      const PacketMetadata& meta)
+                      const PacketMetadata& meta,
+                      std::mutex& bit_mutex,
+                      std::mutex& msg_mutex)
 {
     const auto packet_size = meta.bits_per_packet();
 
-    fmt::print(stderr, "starting extract msg loop\n");
+    logger->info(fmt::format("starting extract msg loop\n"));
     while (true) {
         while (thread_safe::size(bit_buffer, bit_mutex) < packet_size) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -170,107 +178,11 @@ void extract_msg_loop(boost::circular_buffer<BitType>& bit_buffer,
 }
 
 
-template<class Vec>
-auto inner_product(const Vec& first, const Vec& second)
-{
-    assert(!first.empty());
-    assert(first.size() == second.size());
-
-    return std::inner_product(first.begin(), first.end(), second.begin(),
-                              decltype(first[0]){ })
-        / first.size();
-}
-
-template<class Iter>
-std::vector<float> decode(Iter first_it,
-                          std::size_t num_bits,
-                          const CarrierSpecs& carrier_specs)
-{
-    std::vector<float> result(num_bits);
-
-    const auto N = carrier_specs.samples_per_bit;
-
-    auto first = std::vector<float>(N);
-    auto second = std::vector<float>(N);
-
-    std::copy_n(first_it, N, first.begin());
-
-    auto sign = 1;
-    for (auto i = 0u; i < num_bits; ++i) {
-        std::copy_n(first_it + (i+1)*N, N, second.begin());
-
-        result[i] = sign * inner_product(first, second);
-        sign = result[i]>0 ? 1 : -1;
-
-        first = second;
-    }
-
-    return result;
-}
-
-float calc_cost(const std::vector<float>& decoded)
-{
-    auto result = 0.0f;
-
-    auto cost_func = [](float x) {
-        return 1.0 / (x*x + 1e-100);
-    };
-
-    for (auto d : decoded) {
-        result += cost_func(d);
-    }
-
-    return result;
-}
-
-BitType digitize(float decoded)
-{
-    return decoded > 0.0 ? 1 : 0;
-}
-
-std::vector<BitType> digitize(const std::vector<float>& decoded, bool invert)
-{
-    std::vector<BitType> result;
-    result.reserve(decoded.size());
-
-    if (!invert) {
-        for (auto d : decoded) {
-            result.push_back(digitize(d));
-        }
-    }
-    else {
-        for (auto d : decoded) {
-            result.push_back(1 - digitize(d));
-        }
-    }
-
-    return result;
-}
-
 // Valid packet prefix looks like "0111011101110111..."
 bool valid_prefix(const std::vector<BitType>& bits)
 {
-    // Just to make sure that a packet prefix passing this test isn't too small
-    if (bits.size() < 5) {
-        return false;
-    }
-
-    if (bits[0] + bits[1] + bits[2] + bits[3] != 3) {
-        return false;
-    }
-
-    auto start = 0u;
-    for (auto i = 1; i < 4; ++i) {
-        if (bits[i] == 0) {
-            start = i;
-            break;
-        }
-    }
-
-    for (auto i = start; i < bits.size()-3; i += 4) {
-        if (bits[i] != 0 ||
-            bits[i+1]*bits[i+2]*bits[i+3] != 1)
-        {
+    for (auto i = 0u; i < bits.size()-4; i++) {
+        if (bits[i] + bits[i+1] + bits[i+2] + bits[i+3] + bits[i+4] != 1) {
             return false;
         }
     }
@@ -278,87 +190,148 @@ bool valid_prefix(const std::vector<BitType>& bits)
     return true;
 }
 
+
+std::size_t find_best_delay(CircularIter signal_first,
+                            CircularIter signal_last,
+                            SignalMapFunc map_func,
+                            SignalCostFunc cost_func,
+                            const CarrierSpecs& specs)
+{
+    const auto samples_per_bit = specs.samples_per_bit;
+    const auto total_samples = static_cast<std::size_t>(
+        std::distance(signal_first, signal_last));
+
+    assert(total_samples > samples_per_bit);
+
+    auto best_delay = 0;
+    auto best_cost = cost_func(map_func(signal_first, signal_last, specs));
+
+    for (auto delay = 1u; delay <= samples_per_bit; ++delay) {
+        auto cost = cost_func(map_func(signal_first+delay, signal_last, specs));
+
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_delay = delay;
+        }
+    }
+
+    return best_delay;
+}
+
+
+std::vector<BitType> decode(CircularIter signal_first,
+                            CircularIter signal_last,
+                            SignalMapFunc map_func,
+                            SignalReduceFunc reduce_func,
+                            const CarrierSpecs& specs,
+                            bool invert)
+{
+    auto result = reduce_func(map_func(signal_first, signal_last, specs));
+
+    if (invert) {
+        std::for_each(result.begin(), result.end(), [](auto& bit) {
+            bit = 1 - bit;
+        });
+    }
+
+    return result;
+}
+
+
+
 void decode_loop(boost::circular_buffer<float>& raw_buffer,
                  boost::circular_buffer<BitType>& bit_buffer,
-                 const CarrierSpecs& carrier_specs,
-                 const PacketMetadata& packet_meta)
+                 const CarrierSpecs& specs,
+                 const PacketMetadata& packet_meta,
+                 SignalMapFunc map_func,
+                 SignalReduceFunc reduce_func,
+                 SignalCostFunc cost_func,
+                 std::mutex& raw_mutex,
+                 std::mutex& bit_mutex)
 {
-    const auto N = carrier_specs.samples_per_bit;
+    const auto samples_per_bit = specs.samples_per_bit;
+    const auto signal_probe_size = specs.bits_per_prefix * samples_per_bit / 2;
+    const auto samples_to_consume =
+        (packet_meta.bits_per_packet() + specs.bits_per_prefix)
+        * samples_per_bit;
+    const auto max_delay = samples_per_bit;
+    const auto min_raw_buffer_size = samples_to_consume + max_delay;
 
-    const auto min_raw_buffer_size = (packet_meta.bits_per_packet()
-                                      + carrier_specs.bits_per_prefix/2
-                                      + carrier_specs.bits_per_suffix/2) * N;
-
-    fmt::print(stderr, "start decode loop\n");
+    logger->info(fmt::format("start decode loop\n"));
     while (true) {
-        while (thread_safe::size(raw_buffer, raw_mutex) < min_raw_buffer_size) {
+        while (thread_safe::size(raw_buffer, raw_mutex) <= min_raw_buffer_size)
+        {
             std::this_thread::sleep_for(std::chrono::microseconds(1));
         }
 
         auto lock = std::lock_guard{raw_mutex};
 
-        if (raw_buffer.size() < min_raw_buffer_size) {
+        if (raw_buffer.size() <= min_raw_buffer_size) {
             continue;
         }
-        const auto bits_per_half_prefix = carrier_specs.bits_per_prefix / 2;
 
-        auto best_shift = 0;
-        auto best_cost = std::numeric_limits<float>::max();
-        auto best_decoded = std::vector<float>{ };
+        const auto best_delay = find_best_delay(
+            raw_buffer.begin(),
+            raw_buffer.begin() + signal_probe_size,
+            map_func,
+            cost_func,
+            specs);
+
+        raw_buffer.erase_begin(best_delay);
 
 
-        for (auto shift = 0u; shift < N; shift += samples_per_cycle/2) {
-            auto curr_decoded = decode(raw_buffer.begin() + shift,
-                                       bits_per_half_prefix,
-                                       carrier_specs);
-            auto curr_cost = calc_cost(curr_decoded);
-            if (curr_cost < best_cost) {
-                best_cost = curr_cost;
-                best_decoded = curr_decoded;
-                best_shift = shift;
-            }
-        }
+        auto normal_match = valid_prefix(decode(
+                raw_buffer.begin(),
+                raw_buffer.begin() + signal_probe_size,
+                map_func,
+                reduce_func,
+                specs,
+                false));
+        auto inverted_match = valid_prefix(decode(
+                raw_buffer.begin(),
+                raw_buffer.begin() + signal_probe_size,
+                map_func,
+                reduce_func,
+                specs,
+                true));
+        auto any_match = normal_match || inverted_match;
 
-        auto digitized = digitize(best_decoded, false);
-        auto digitized_inverted = digitize(best_decoded, true);
-
-        bool invert = false;
-        if (valid_prefix(digitized)) {
-        }
-        else if (valid_prefix(digitized_inverted)) {
-            invert = true;
-        }
-        else {
-            raw_buffer.erase_begin(N * bits_per_half_prefix / 2);
+        if (!any_match) {
+            raw_buffer.erase_begin(signal_probe_size);
             continue;
         }
+
+        auto invert = inverted_match;
 
         static int k = 0;
-        fmt::print(stderr, "\n-----{}-----{}-----\n", k++, raw_buffer.size());
-        std::vector<BitType> data = digitize(
-            decode(raw_buffer.begin() + best_shift,
-                   min_raw_buffer_size/N - 3,
-                   carrier_specs), invert);
+        logger->info(fmt::format("-----{}-----{}-----",
+                                 k++, raw_buffer.size()));
+        std::vector<BitType> data = decode(
+            raw_buffer.begin(),
+            raw_buffer.begin() + samples_to_consume,
+            map_func,
+            reduce_func,
+            specs,
+            invert);
 
         {
             auto bit_lock = std::lock_guard{bit_mutex};
             for (auto bit : data) {
-                // fmt::print(stderr, "{}", bit);
+                // fmt::print("{}", bit);
                 bit_buffer.push_back(bit);
             }
+            // fmt::print("\n");
         }
 
-        // TODO: maybe should erase a different amount (based on how much was
-        // consumed in decode(), (or maybe it doesn't matter since the edge will
-        // reside in a `telomere'
-        raw_buffer.erase_begin(min_raw_buffer_size);
+        raw_buffer.erase_begin(samples_to_consume);
     }
 }
 
 
 // Move raw data from the thread-safe buffer to the thread-unsafe buffer
 void pour_to_raw_buffer(boost::lockfree::spsc_queue<float>& raw_queue,
-                        boost::circular_buffer<float>& raw_buffer)
+                        boost::circular_buffer<float>& raw_buffer,
+                        std::mutex& raw_mutex)
 {
     constexpr auto samples_per_pour = sample_rate / 10;
 
@@ -376,59 +349,30 @@ void pour_to_raw_buffer(boost::lockfree::spsc_queue<float>& raw_queue,
     }
 }
 
-int main()
+
+Receiver::Receiver(const CarrierSpecs& specs, const PacketMetadata& meta,
+                   SignalMapFunc map_func, SignalReduceFunc reduce_func,
+                   SignalCostFunc cost_func)
+    : lockfree_raw_buffer_(lockfree_raw_buffer_size),
+    raw_buffer_(raw_buffer_size),
+    bit_buffer_(bit_buffer_size),
+    msg_buffer_(msg_buffer_size),
+    specs_{specs},
+    meta_{meta},
+    map_func_{map_func},
+    reduce_func_{reduce_func},
+    cost_func_{cost_func}
 {
-    auto lockfree_raw_buffer = boost::lockfree::spsc_queue<float>(1ul << 20);
-    auto raw_buffer = boost::circular_buffer<float>(1ul << 20);
-    auto bit_buffer = boost::circular_buffer<BitType>(1ul << 20);
-    auto msgs = boost::circular_buffer<std::vector<BitType>>(50);
-
-    auto meta = PacketMetadata {
-        .head_signature = bits_from_str(HEAD_SIGNATURE),
-        .tail_signature = bits_from_str(TAIL_SIGNATURE),
-        .bits_per_body = strlen(PACKET_BODY)
-    };
-
-    auto carrier_specs = CarrierSpecs {
-        .samples_per_bit = samples_per_bit,
-        .bits_per_prefix = strlen(PACKET_PREFIX),
-        .bits_per_suffix = strlen(PACKET_SUFFIX),
-        .frequency = frequency
-    };
-
-
-
-    auto l1 = std::thread(extract_msg_loop, std::ref(bit_buffer),
-                          std::ref(msgs), std::cref(meta));
-    auto l2 = std::thread(decode_loop, std::ref(raw_buffer),
-                          std::ref(bit_buffer), std::ref(carrier_specs),
-                          std::ref(meta));
-    auto l3 = std::thread(pour_to_raw_buffer, std::ref(lockfree_raw_buffer),
-                          std::ref(raw_buffer));
-    launch_mic_loop(lockfree_raw_buffer);
-
-    const auto body = std::string{PACKET_BODY};
-
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-
-        while (thread_safe::size(msgs, msg_mutex) > 0) {
-            auto msg_lock = std::lock_guard{msg_mutex};
-
-            if (msgs.empty()) {
-                break;
-            }
-
-            auto msg = *msgs.begin();
-            msgs.pop_front();
-            fmt::print("\nmsg: ");
-            for (auto i = 0u; i < msg.size(); ++i) {
-                fmt::print(msg[i]+'0'==body[i]
-                           ? fmt::bg(fmt::color::green)
-                           : fmt::bg(fmt::color::red),
-                           "{}", msg[i]);
-            }
-            fmt::print("\n");
-        }
-    }
+    using std::ref, std::cref;
+    msg_loop_thread_ = std::thread(extract_msg_loop, ref(bit_buffer_),
+                                   ref(msg_buffer_), cref(meta_), ref(bit_mutex_),
+                                   ref(msg_mutex_));
+    decode_loop_thread_ = std::thread(decode_loop, ref(raw_buffer_),
+                                     ref(bit_buffer_),
+                                     ref(specs_), ref(meta_),
+                                     map_func_, reduce_func_, cost_func_,
+                                     ref(raw_mutex_), ref(bit_mutex_));
+    pour_thread_ = std::thread(pour_to_raw_buffer, ref(lockfree_raw_buffer_),
+                               ref(raw_buffer_), ref(raw_mutex_));
+    launch_mic_loop(lockfree_raw_buffer_);
 }
