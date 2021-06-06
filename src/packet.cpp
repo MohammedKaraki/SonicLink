@@ -15,6 +15,7 @@ auto create_msg_body(uint16_t id, Bytes& data) -> ErrorCheckedMessage
     auto result = ErrorCheckedMessage {
         .id = id,
         .data = data,
+        .checksum = 0
     };
     result.checksum = result.calc_checksum();
 

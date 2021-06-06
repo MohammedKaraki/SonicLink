@@ -4,7 +4,7 @@ objects := $(sources:.cpp=.o)
 link_flags := 
 compile_flags := -g -O0 -std=c++20 -Wall -Wpedantic -Wextra
 
-CC := clang++
+CC := g++
 
 x: $(objects)
 	$(CC) $(link_flags) $^ -o $@  -lpthread -lportaudio -lasound -lfmt
