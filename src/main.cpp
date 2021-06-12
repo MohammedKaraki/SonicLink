@@ -138,7 +138,7 @@ namespace psk {
 }
 
 
-int main()
+int main(int argc, char *[])
 {
     if (std::freopen("/dev/null", "w", stderr)) {
         std::fclose(stderr);
@@ -147,15 +147,18 @@ int main()
     std::cin >> std::noskipws;
     std::cout << std::noskipws;
     auto msg_str = std::string{};
-    for (char c; std::cin >> c; ) {
+    if (argc == 2) {
+      for (char c; std::cin.read(&c, 1); ) {
         msg_str += c;
+      }
     }
+    fmt::print("********* START *********\n");
 
 
     auto packet_bodies = prepare_packet_bodies(msg_str, bytes_per_msg_data);
 
 
-    const auto samples_per_cycle = 8;
+    const auto samples_per_cycle = 12;
     const auto samples_per_bit = 4 * samples_per_cycle;
     const auto frequency = 1.0f / (samples_per_cycle);
 
@@ -176,7 +179,10 @@ int main()
     Receiver receiver{specs, meta, psk::map, psk::reduce, psk::cost};
     Sender sender{specs, psk::encode};
 
-    auto sender_loop = [&packet_bodies](Sender& sender) {
+    auto sender_loop = [&msg_str, &packet_bodies](Sender& sender) {
+      if (msg_str.empty()) {
+        return;
+      }
         std::vector<std::vector<BitType>> digit_vec_packets;
         for (auto& packet_body : packet_bodies) {
             digit_vec_packets.emplace_back(
@@ -217,6 +223,8 @@ int main()
                 auto msg_bin = binarize_digits(stringify_bit_vec(msg_vec));
                 auto msg = msg_from_binary(msg_bin);
 
+                fmt::print("{}\n", std::string(msg.data));
+
                 if (msg.valid()) {
                     if (msg.id > last_printed) {
                         if (!recv_msgs.contains(msg.id)) {
@@ -227,7 +235,7 @@ int main()
 
                 while (recv_msgs.contains(last_printed+1)) {
                     ++last_printed;
-                    fmt::print("{}", std::string(recv_msgs[last_printed]));
+                    // fmt::print("{}", std::string(recv_msgs[last_printed]));
                     fflush(stdout);
                 }
             }
