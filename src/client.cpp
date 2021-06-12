@@ -23,11 +23,11 @@ int main()
   const auto samples_per_cycle_client = 8u;
 
 
-  auto client = SonicLink::Client{sample_rate,
-                                  cycles_per_bit_server,
-                                  cycles_per_bit_client,
-                                  samples_per_cycle_server,
-                                  samples_per_cycle_client};
+  // auto client = SonicLink::Client{sample_rate,
+  //                                 cycles_per_bit_server,
+  //                                 cycles_per_bit_client,
+  //                                 samples_per_cycle_server,
+  //                                 samples_per_cycle_client};
 
   const auto message = std::string_view{
     "This is a message.\n"
@@ -50,8 +50,10 @@ int main()
     "But this is a wonderful message.\n"
     "And this is the end of the message.\n"};
 
-  const auto bytes = std::as_bytes(std::span(message.begin(), message.end()));
-  client.send_bytes(bytes);
+  fmt::print("{}\n{}\n", message, message.size());
 
-  client.wait();
+  const auto bytes = std::as_bytes(std::span(message.begin(), message.end()));
+  // client.send_bytes(bytes);
+  //
+  // client.wait();
 }
